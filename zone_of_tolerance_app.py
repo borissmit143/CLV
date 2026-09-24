@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from io import BytesIO
 from pathlib import Path
@@ -16,15 +17,16 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_USERS_FILE = APP_DIR / "users.xlsx"
 MODEL_NAME = "gemini-3.1-flash-lite"
 CAC_PER_CUSTOMER = 100.0
+SIMULATION_VERSION = 2
 YEARS = range(1, 6)
 
 
 class RetentionResponse(BaseModel):
-    year_1: bool = Field(description="Whether the customer uses the service again in year 1")
-    year_2: bool = Field(description="Whether the retained customer uses it again in year 2")
-    year_3: bool = Field(description="Whether the retained customer uses it again in year 3")
-    year_4: bool = Field(description="Whether the retained customer uses it again in year 4")
-    year_5: bool = Field(description="Whether the retained customer uses it again in year 5")
+    year_1_probability: int = Field(ge=0, le=100, description="Calibrated probability of returning in year 1")
+    year_2_probability: int = Field(ge=0, le=100, description="Conditional probability of returning in year 2")
+    year_3_probability: int = Field(ge=0, le=100, description="Conditional probability of returning in year 3")
+    year_4_probability: int = Field(ge=0, le=100, description="Conditional probability of returning in year 4")
+    year_5_probability: int = Field(ge=0, le=100, description="Conditional probability of returning in year 5")
     reason: str = Field(description="One concise sentence explaining the decisions")
 
 
@@ -129,13 +131,26 @@ Target customer persona supplied by the researcher:
 Individual customer profile:
 {profile_text}
 
-Decide whether this customer would continue using the service in each of the next five years.
-Use only the supplied information; do not invent discounts, product changes, or personal facts.
-Retention is cumulative: after the first false decision, all later years must be false. Return
-five boolean decisions and one concise reason."""
+Estimate this customer's probability (an integer from 0 to 100) of using the service again in
+each of the next five years. Years 2-5 are conditional probabilities: estimate the chance of
+returning that year if the customer was still active in the prior year.
+
+Be realistically calibrated, not promotional. A generally useful service does not imply 100%
+retention. Account for ordinary churn, changing needs, price sensitivity, competing services,
+relocation, and declining relevance when consistent with the supplied profile. Reserve values
+above 90 for unusually strong, explicit evidence of durable loyalty, and use the full range to
+distinguish profiles. Do not invent discounts, product changes, or personal facts. Return five
+probabilities and one concise reason."""
 
 
-async def query_profile(profile_id: int, prompt: str, llm, semaphore: asyncio.Semaphore) -> dict:
+def stable_draw(profile_id: int, year: int, firm: str) -> float:
+    """Return a reproducible pseudo-random percentile for a profile/year."""
+    key = f"{firm.casefold().strip()}|{profile_id}|{year}".encode("utf-8")
+    integer = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+    return integer / (2**64 - 1) * 100
+
+
+async def query_profile(profile_id: int, firm: str, prompt: str, llm, semaphore: asyncio.Semaphore) -> dict:
     async with semaphore:
         for attempt in range(5):
             try:
@@ -143,7 +158,9 @@ async def query_profile(profile_id: int, prompt: str, llm, semaphore: asyncio.Se
                 retained = True
                 decisions = {}
                 for year in YEARS:
-                    retained = retained and bool(getattr(response, f"year_{year}"))
+                    probability = int(getattr(response, f"year_{year}_probability"))
+                    decisions[f"Year {year} probability"] = probability / 100
+                    retained = retained and stable_draw(profile_id, year, firm) < probability
                     decisions[f"Year {year} return"] = retained
                 return {"Profile ID": profile_id, **decisions, "Reason": response.reason, "Status": "Success"}
             except Exception as exc:
@@ -172,7 +189,7 @@ def simulate_retention(profiles_df: pd.DataFrame, firm: str, description: str, p
     for profile_id, (_, row) in enumerate(profiles_df.iterrows(), start=1):
         profile = {str(column): value for column, raw in row.items() if (value := clean_value(raw)) is not None}
         profiles[profile_id] = profile
-        tasks.append(query_profile(profile_id, make_prompt(firm, description, persona, profile), llm, semaphore))
+        tasks.append(query_profile(profile_id, firm, make_prompt(firm, description, persona, profile), llm, semaphore))
     progress = st.progress(0, text="Preparing profile simulations...")
     responses = asyncio.run(run_all(tasks, progress))
     progress.empty()
@@ -278,7 +295,12 @@ if st.button("Simulate five-year CLV", type="primary", use_container_width=True)
         st.session_state["clv_run"] = {
             "responses": responses, "firm": firm_name,
             "monthly_sales": monthly_sales, "margin": margin_percent,
+            "version": SIMULATION_VERSION,
         }
+
+if "clv_run" in st.session_state and st.session_state["clv_run"].get("version") != SIMULATION_VERSION:
+    del st.session_state["clv_run"]
+    st.info("The retention method was updated. Run the simulation again to generate calibrated results.")
 
 if "clv_run" in st.session_state:
     run = st.session_state["clv_run"]
